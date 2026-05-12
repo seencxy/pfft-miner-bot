@@ -33,10 +33,13 @@ Usage:
   node pfft-miner.mjs status [--address 0x...]
   node pfft-miner.mjs mine [--count 1] [--workers 4] [--gpu] [--dry-run]
   node pfft-miner.mjs mine --multi-gpu [--count 0] [--cuda-bin PATH]
+  node pfft-miner.mjs fund-wallets [--start-index 0] [--wallet-count 8] [--amount-eth 0.01]
   node pfft-miner.mjs selftest
 
 Env:
   PFFT_PRIVATE_KEY   Private key burner wallet for real mint
+  PFFT_FUNDER_PRIVATE_KEY Private key for fund-wallets source wallet
+  PFFT_TARGET_MNEMONIC    Mnemonic for fund-wallets target wallets
   PFFT_RPC_URL       Ethereum mainnet RPC URL (default publicnode)
   ETH_RPC_URL        Fallback RPC URL
 
@@ -55,6 +58,10 @@ Options:
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
+  --start-index N    fund-wallets mnemonic start index, default prompts
+  --wallet-count N   fund-wallets target wallet count, default prompts
+  --amount-eth N     fund-wallets amount sent to each wallet, default prompts
+  --yes              Skip final SEND confirmation for fund-wallets
 `);
 }
 
@@ -64,7 +71,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help', 'gpu', 'multi-gpu', 'start-random'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu', 'multi-gpu', 'start-random', 'yes'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -132,10 +139,24 @@ function parseNonNegativeIntegerArg(value, name) {
   if (!Number.isInteger(n) || n < 0) throw new Error(`${name} must be a non-negative integer`);
   return n;
 }
+function parsePositiveIntegerArg(value, name) {
+  const n = parseNonNegativeIntegerArg(value, name);
+  if (n <= 0) throw new Error(`${name} must be greater than zero`);
+  return n;
+}
 function parsePositiveBigIntArg(value, name) {
   const v = parseBigIntArg(value, name);
   if (v <= 0n) throw new Error(`${name} must be greater than zero`);
   return v;
+}
+function parseEthAmountArg(value, name) {
+  try {
+    const wei = ethers.parseEther(String(value));
+    if (wei <= 0n) throw new Error('non-positive');
+    return wei;
+  } catch {
+    throw new Error(`${name} must be a positive ETH amount`);
+  }
 }
 function powHash(challenge, nonce) {
   // Matches site worker: ethers.solidityPackedKeccak256(['bytes32','uint256'], [challenge, nonce])
@@ -318,6 +339,54 @@ async function promptSecret(question) {
   }
 }
 
+async function promptRequiredSecret(question, envValue) {
+  if (envValue) return envValue;
+  while (true) {
+    const value = await promptSecret(question);
+    if (value) return value;
+    console.log('Value is required.');
+  }
+}
+
+async function promptNonNegativeInteger(question, defaultValue) {
+  while (true) {
+    const suffix = defaultValue === undefined ? ': ' : ` [default ${defaultValue}]: `;
+    const answer = await promptLine(`${question}${suffix}`);
+    if (answer === '' && defaultValue !== undefined) return defaultValue;
+    try {
+      return parseNonNegativeIntegerArg(answer, question);
+    } catch (err) {
+      console.log(err.message);
+    }
+  }
+}
+
+async function promptPositiveInteger(question, defaultValue) {
+  while (true) {
+    const suffix = defaultValue === undefined ? ': ' : ` [default ${defaultValue}]: `;
+    const answer = await promptLine(`${question}${suffix}`);
+    if (answer === '' && defaultValue !== undefined) return defaultValue;
+    try {
+      return parsePositiveIntegerArg(answer, question);
+    } catch (err) {
+      console.log(err.message);
+    }
+  }
+}
+
+async function promptEthAmount(question, defaultValue) {
+  while (true) {
+    const suffix = defaultValue === undefined ? ': ' : ` [default ${defaultValue}]: `;
+    const answer = await promptLine(`${question}${suffix}`);
+    const value = answer === '' && defaultValue !== undefined ? defaultValue : answer;
+    try {
+      return parseEthAmountArg(value, question);
+    } catch (err) {
+      console.log(err.message);
+    }
+  }
+}
+
 async function promptGpuCount(devices) {
   while (true) {
     const answer = await promptLine(`How many GPUs to start? [1-${devices.length}, default ${devices.length}]: `);
@@ -337,6 +406,102 @@ async function promptWalletContractForDevice(device) {
     } catch {
       console.log('Invalid private key, try again.');
     }
+  }
+}
+
+function normalizeMnemonic(mnemonic) {
+  return String(mnemonic || '').trim().replace(/\s+/g, ' ');
+}
+
+function deriveMnemonicAddress(mnemonic, index) {
+  const path = `m/44'/60'/0'/0/${index}`;
+  return ethers.HDNodeWallet.fromPhrase(normalizeMnemonic(mnemonic), undefined, path).address;
+}
+
+function feeOverridesFromArgs(args, feeData) {
+  const overrides = {};
+  if (args['max-fee-gwei'] || feeData.maxFeePerGas != null) {
+    overrides.maxFeePerGas = args['max-fee-gwei']
+      ? ethers.parseUnits(String(args['max-fee-gwei']), 'gwei')
+      : feeData.maxFeePerGas;
+    overrides.maxPriorityFeePerGas = args['priority-gwei']
+      ? ethers.parseUnits(String(args['priority-gwei']), 'gwei')
+      : (feeData.maxPriorityFeePerGas ?? 0n);
+    return { overrides, balanceFeePerGas: overrides.maxFeePerGas, label: `${ethers.formatUnits(overrides.maxFeePerGas, 'gwei')} gwei maxFee` };
+  }
+  if (args['priority-gwei']) throw new Error('--priority-gwei requires EIP-1559 max fee support from the RPC');
+  if (feeData.gasPrice == null) throw new Error('RPC did not return gas price data');
+  overrides.gasPrice = feeData.gasPrice;
+  return { overrides, balanceFeePerGas: overrides.gasPrice, label: `${ethers.formatUnits(overrides.gasPrice, 'gwei')} gwei gasPrice` };
+}
+
+async function fundWallets(args) {
+  const p = provider();
+  const fundingPk = await promptRequiredSecret('Funding private key: ', process.env.PFFT_FUNDER_PRIVATE_KEY);
+  const mnemonic = await promptRequiredSecret('Target mnemonic phrase: ', process.env.PFFT_TARGET_MNEMONIC);
+  const fundingWallet = new ethers.Wallet(normalizePrivateKey(fundingPk), p);
+  const startIndex = args['start-index'] === undefined
+    ? await promptNonNegativeInteger('Mnemonic start index', 0)
+    : parseNonNegativeIntegerArg(args['start-index'], '--start-index');
+  const walletCount = args['wallet-count'] === undefined
+    ? await promptPositiveInteger('Target wallet count')
+    : parsePositiveIntegerArg(args['wallet-count'], '--wallet-count');
+  const amountWei = args['amount-eth'] === undefined
+    ? await promptEthAmount('ETH amount per target wallet')
+    : parseEthAmountArg(args['amount-eth'], '--amount-eth');
+  const targets = Array.from({ length: walletCount }, (_, offset) => {
+    const index = startIndex + offset;
+    return { index, address: deriveMnemonicAddress(mnemonic, index) };
+  });
+  const balance = await p.getBalance(fundingWallet.address);
+  const feeData = await p.getFeeData();
+  const gasLimit = 21000n;
+  const { overrides: feeOverrides, balanceFeePerGas, label: feeLabel } = feeOverridesFromArgs(args, feeData);
+  const valueTotal = amountWei * BigInt(walletCount);
+  const maxGasTotal = gasLimit * balanceFeePerGas * BigInt(walletCount);
+  const maxRequired = valueTotal + maxGasTotal;
+
+  console.log(`Funding wallet: ${fundingWallet.address}`);
+  console.log(`Funding balance: ${ethers.formatEther(balance)} ETH`);
+  console.log(`Mnemonic path: m/44'/60'/0'/0/{index}`);
+  console.log(`Start index: ${startIndex}`);
+  console.log(`Target wallets: ${walletCount}`);
+  console.log(`Amount per wallet: ${ethers.formatEther(amountWei)} ETH`);
+  console.log(`Transfer total: ${ethers.formatEther(valueTotal)} ETH`);
+  console.log(`Gas model: ${gasLimit.toString()} gas per transfer at ${feeLabel}`);
+  console.log(`Max gas reserve: ${ethers.formatEther(maxGasTotal)} ETH`);
+  console.log(`Max required: ${ethers.formatEther(maxRequired)} ETH`);
+  console.log('Targets:');
+  for (const target of targets) console.log(`  [${target.index}] ${target.address}`);
+
+  if (balance < maxRequired) {
+    const message = `Insufficient funding balance. Need up to ${ethers.formatEther(maxRequired)} ETH, have ${ethers.formatEther(balance)} ETH.`;
+    if (args['dry-run']) console.log(`Dry-run warning: ${message}`);
+    else throw new Error(message);
+  }
+  if (args['dry-run']) {
+    console.log('Dry-run: no transfers sent.');
+    return;
+  }
+  if (!args.yes) {
+    const confirmation = await promptLine('Type SEND to broadcast these transfers: ');
+    if (confirmation !== 'SEND') throw new Error('Cancelled');
+  }
+
+  let nonce = await p.getTransactionCount(fundingWallet.address, 'pending');
+  for (const target of targets) {
+    const tx = await fundingWallet.sendTransaction({
+      to: target.address,
+      value: amountWei,
+      gasLimit,
+      nonce,
+      ...feeOverrides
+    });
+    console.log(`[${target.index}] Tx sent: ${tx.hash}`);
+    nonce++;
+    const rcpt = await tx.wait();
+    if (rcpt.status !== 1) throw new Error(`[${target.index}] Transfer failed: ${tx.hash}`);
+    console.log(`[${target.index}] Confirmed: block ${rcpt.blockNumber}`);
   }
 }
 
@@ -499,6 +664,8 @@ async function selftest() {
   if (powHash(challenge, nonce) !== BigInt(h)) throw new Error('powHash mismatch');
   if (!validPow(challenge, nonce, 2n ** 256n - 1n)) throw new Error('validPow high target failed');
   if (validPow(challenge, nonce, 0n) !== (BigInt(h) === 0n)) throw new Error('validPow zero target failed');
+  const addr = deriveMnemonicAddress('test test test test test test test test test test test junk', 3);
+  if (addr !== '0x90F79bf6EB2c4f870365E785982E1f101E93b906') throw new Error('mnemonic derivation mismatch');
   console.log('selftest ok');
 }
 
@@ -508,6 +675,7 @@ async function main() {
   if (cmd === 'help' || args.help) return usage();
   if (cmd === 'status') return status(args.address || process.env.PFFT_ADDRESS);
   if (cmd === 'mine') return mine(args);
+  if (cmd === 'fund-wallets') return fundWallets(args);
   if (cmd === 'selftest') return selftest();
   throw new Error(`Unknown command: ${cmd}`);
 }

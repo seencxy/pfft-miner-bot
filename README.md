@@ -117,6 +117,30 @@ node pfft-miner.mjs mine --multi-gpu --count 0 --cuda-bin ./build/pfft-cuda-mine
 
 Bot akan menjalankan `nvidia-smi -L`, menanyakan jumlah GPU yang dipakai, lalu meminta private key berbeda untuk tiap GPU. Wallet address akan ditampilkan setelah private key dimasukkan.
 
+## Fund wallets from mnemonic
+
+Distribute ETH gas from one funding wallet to addresses derived from a mnemonic:
+
+```bash
+node pfft-miner.mjs fund-wallets
+```
+
+The command asks for the funding private key, target mnemonic, mnemonic start index, wallet count, and ETH amount per wallet. It previews all target addresses and requires typing `SEND` before broadcasting.
+
+Dry-run without sending:
+
+```bash
+node pfft-miner.mjs fund-wallets --start-index 0 --wallet-count 8 --amount-eth 0.01 --dry-run
+```
+
+Secrets can also be provided through env vars:
+
+```bash
+export PFFT_FUNDER_PRIVATE_KEY="PRIVATE_KEY_WITH_ETH"
+export PFFT_TARGET_MNEMONIC="word1 word2 ..."
+node pfft-miner.mjs fund-wallets --start-index 8 --wallet-count 8 --amount-eth 0.01
+```
+
 Bot otomatis menambahkan buffer 50% di atas `estimateGas` untuk menghindari transaksi gagal karena gas limit terlalu mepet. Override manual jika perlu:
 
 ```bash
