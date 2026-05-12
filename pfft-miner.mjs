@@ -249,6 +249,10 @@ function isPerAddressLimitError(err) {
   return /Exceed per address limit/i.test(errorText(err));
 }
 
+function isInsufficientFundsError(err) {
+  return /insufficient funds/i.test(errorText(err));
+}
+
 function isOutOfGasError(err) {
   const receiptGasUsed = err?.receipt?.gasUsed;
   const txGasLimit = err?.transaction?.gasLimit;
@@ -647,6 +651,11 @@ async function runMineLoop({ options, wallet, contract, cudaDevice = options.cud
           err.mintedDone = done;
           throw err;
         }
+        if (isInsufficientFundsError(err)) {
+          err.pfftCode = 'INSUFFICIENT_FUNDS';
+          err.mintedDone = done;
+          throw err;
+        }
         if (isOutOfGasError(err)) {
           const hash = txHashFromError(err);
           const suffix = hash ? ` Tx: ${hash}` : '';
@@ -660,7 +669,7 @@ async function runMineLoop({ options, wallet, contract, cudaDevice = options.cud
   return done;
 }
 
-async function runGpuMinerWithRotation({ options, initialWorker, rotateWorker }) {
+async function runGpuMinerWithRotation({ options, initialWorker, rotateWorker, topUpWorker }) {
   const label = `GPU ${initialWorker.device.index}`;
   let worker = initialWorker;
   let completed = 0;
@@ -676,19 +685,24 @@ async function runGpuMinerWithRotation({ options, initialWorker, rotateWorker })
         worker = await rotateWorker(worker, label);
         continue;
       }
+      if (err?.pfftCode === 'INSUFFICIENT_FUNDS' && topUpWorker) {
+        console.error(`[${label}] Insufficient funds for ${worker.wallet.address}; topping up and retrying.`);
+        worker = await topUpWorker(worker, label);
+        continue;
+      }
       throw err;
     }
   }
   return true;
 }
 
-async function startGpuMiners(options, workers, rotateWorker) {
+async function startGpuMiners(options, workers, rotateWorker, topUpWorker) {
   console.log(`Starting ${workers.length} GPU miner(s). Count is ${options.count === 0 ? 'infinite' : options.count} per GPU.`);
   const results = await Promise.all(workers.map(({ device, wallet, contract, index }) => {
     const label = `GPU ${device.index}`;
     const walletLabel = index === undefined ? wallet.address : `${wallet.address} (mnemonic index ${index})`;
     console.log(`[${label}] Wallet: ${walletLabel}`);
-    return runGpuMinerWithRotation({ options, initialWorker: { device, wallet, contract, index }, rotateWorker })
+    return runGpuMinerWithRotation({ options, initialWorker: { device, wallet, contract, index }, rotateWorker, topUpWorker })
       .then(() => true)
       .catch(err => {
         console.error(`[${label}] ERROR: ${err.shortMessage || err.reason || err.message || String(err)}`);
@@ -717,18 +731,27 @@ async function promptFundedMnemonicWorkers(args, selected) {
   await fundTargets(args, { fundingPk, targets, amountWei });
   let nextIndex = startIndex + selected.length;
   let fundingQueue = Promise.resolve();
+  const fundOneTarget = async (target) => {
+    const fundingArgs = { ...args, yes: true, 'dry-run': false };
+    const task = fundingQueue.catch(() => {}).then(() => fundTargets(fundingArgs, { fundingPk, targets: [target], amountWei }));
+    fundingQueue = task;
+    await task;
+  };
   const rotateWorker = async (previousWorker, label) => {
     const index = nextIndex++;
     const wc = mnemonicWalletContract(mnemonic, index);
     const target = { index, address: wc.wallet.address };
     console.log(`[${label}] Next mnemonic wallet: ${target.address} (index ${index})`);
-    const rotationArgs = { ...args, yes: true, 'dry-run': false };
-    const task = fundingQueue.catch(() => {}).then(() => fundTargets(rotationArgs, { fundingPk, targets: [target], amountWei }));
-    fundingQueue = task;
-    await task;
+    await fundOneTarget(target);
     return { device: previousWorker.device, index, ...wc };
   };
-  return { workers, rotateWorker };
+  const topUpWorker = async (worker, label) => {
+    const target = { index: worker.index ?? -1, address: worker.wallet.address };
+    console.log(`[${label}] Funding current wallet again: ${target.address}`);
+    await fundOneTarget(target);
+    return worker;
+  };
+  return { workers, rotateWorker, topUpWorker };
 }
 
 async function mineMultiGpu(args) {
@@ -741,12 +764,12 @@ async function mineMultiGpu(args) {
   const selected = devices.slice(0, count);
   const useFundedMnemonic = args['fund-mnemonic'] || await promptYesNo('Use one funding key + mnemonic-derived wallets?', true);
   if (useFundedMnemonic) {
-    const { workers, rotateWorker } = await promptFundedMnemonicWorkers(args, selected);
+    const { workers, rotateWorker, topUpWorker } = await promptFundedMnemonicWorkers(args, selected);
     if (args['dry-run']) {
       console.log('Dry-run: funding preview complete; miners not started.');
       return;
     }
-    return startGpuMiners(options, workers, rotateWorker);
+    return startGpuMiners(options, workers, rotateWorker, topUpWorker);
   }
   console.log('Enter one private key per GPU. Private keys are used in memory only and are not saved.');
   const workers = [];
@@ -774,6 +797,7 @@ async function selftest() {
   const addr = deriveMnemonicAddress('test test test test test test test test test test test junk', 3);
   if (addr !== '0x90F79bf6EB2c4f870365E785982E1f101E93b906') throw new Error('mnemonic derivation mismatch');
   if (!isPerAddressLimitError(new Error('execution reverted: "Exceed per address limit"'))) throw new Error('address limit detection failed');
+  if (!isInsufficientFundsError(new Error('insufficient funds for intrinsic transaction cost'))) throw new Error('insufficient funds detection failed');
   console.log('selftest ok');
 }
 

@@ -127,6 +127,8 @@ Jika tidak memakai `--fund-mnemonic`, multi-GPU mode akan menanyakan apakah ingi
 
 Jika salah satu wallet terkena `Exceed per address limit`, GPU tersebut otomatis mengambil index mnemonic berikutnya, mengirim ETH amount yang sama dari funding wallet, lalu lanjut mining dengan wallet baru.
 
+Jika wallet mining kehabisan ETH dan muncul `insufficient funds for intrinsic transaction cost`, bot otomatis mengirim ETH amount yang sama ke wallet tersebut, lalu retry dengan wallet yang sama.
+
 ## Fund wallets from mnemonic
 
 Standalone ETH distribution, without starting miners:
