@@ -55,7 +55,7 @@ Options:
   --start-random     Use random GPU search start nonce (default)
   --duplicate-retries N Retry when chain rejects an already used PoW nonce, default 5
   --gas-limit N      Manual gas limit for freeMint transactions
-  --gas-buffer-percent N Add gas estimate buffer, default 50
+  --gas-buffer-percent N Add gas estimate buffer, default 20
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
@@ -243,6 +243,10 @@ function errorText(err) {
 
 function isDuplicatePowNonceError(err) {
   return /Duplicate POW nonce/i.test(errorText(err));
+}
+
+function isPerAddressLimitError(err) {
+  return /Exceed per address limit/i.test(errorText(err));
 }
 
 function isOutOfGasError(err) {
@@ -565,7 +569,7 @@ function parseMineOptions(args, forceGpu = false) {
   const count = args.count === undefined ? 1 : parseNonNegativeIntegerArg(args.count, '--count');
   const workers = args.workers ? Math.max(1, parseNonNegativeIntegerArg(args.workers, '--workers')) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
   const duplicateRetries = args['duplicate-retries'] === undefined ? 5 : parseNonNegativeIntegerArg(args['duplicate-retries'], '--duplicate-retries');
-  const gasBufferPercent = args['gas-buffer-percent'] === undefined ? 50 : parseNonNegativeIntegerArg(args['gas-buffer-percent'], '--gas-buffer-percent');
+  const gasBufferPercent = args['gas-buffer-percent'] === undefined ? 20 : parseNonNegativeIntegerArg(args['gas-buffer-percent'], '--gas-buffer-percent');
   const manualGasLimit = args['gas-limit'] === undefined ? undefined : parsePositiveBigIntArg(args['gas-limit'], '--gas-limit');
   const cudaDevice = args['cuda-device'] === undefined ? undefined : parseNonNegativeIntegerArg(args['cuda-device'], '--cuda-device');
   const dryRun = !!args['dry-run'];
@@ -638,24 +642,53 @@ async function runMineLoop({ options, wallet, contract, cudaDevice = options.cud
           log(`Duplicate POW nonce rejected; retrying with a new search start (${duplicateFailures}/${options.duplicateRetries}).`);
           continue;
         }
+        if (isPerAddressLimitError(err)) {
+          err.pfftCode = 'ADDRESS_LIMIT';
+          err.mintedDone = done;
+          throw err;
+        }
         if (isOutOfGasError(err)) {
           const hash = txHashFromError(err);
           const suffix = hash ? ` Tx: ${hash}` : '';
           throw new Error(`Mint transaction exhausted its gas limit. Increase --gas-limit or --gas-buffer-percent.${suffix}`);
         }
+        err.mintedDone = done;
         throw err;
       }
     }
   }
+  return done;
 }
 
-async function startGpuMiners(options, workers) {
+async function runGpuMinerWithRotation({ options, initialWorker, rotateWorker }) {
+  const label = `GPU ${initialWorker.device.index}`;
+  let worker = initialWorker;
+  let completed = 0;
+  while (options.count === 0 || completed < options.count) {
+    const runOptions = options.count === 0 ? options : { ...options, count: options.count - completed };
+    try {
+      completed += await runMineLoop({ options: runOptions, wallet: worker.wallet, contract: worker.contract, cudaDevice: worker.device.index, label, log: prefixedLog(label) });
+      return true;
+    } catch (err) {
+      completed += Number(err?.mintedDone || 0);
+      if (err?.pfftCode === 'ADDRESS_LIMIT' && rotateWorker) {
+        console.error(`[${label}] Address limit reached for ${worker.wallet.address}; switching to next mnemonic wallet.`);
+        worker = await rotateWorker(worker, label);
+        continue;
+      }
+      throw err;
+    }
+  }
+  return true;
+}
+
+async function startGpuMiners(options, workers, rotateWorker) {
   console.log(`Starting ${workers.length} GPU miner(s). Count is ${options.count === 0 ? 'infinite' : options.count} per GPU.`);
   const results = await Promise.all(workers.map(({ device, wallet, contract, index }) => {
     const label = `GPU ${device.index}`;
     const walletLabel = index === undefined ? wallet.address : `${wallet.address} (mnemonic index ${index})`;
     console.log(`[${label}] Wallet: ${walletLabel}`);
-    return runMineLoop({ options, wallet, contract, cudaDevice: device.index, label, log: prefixedLog(label) })
+    return runGpuMinerWithRotation({ options, initialWorker: { device, wallet, contract, index }, rotateWorker })
       .then(() => true)
       .catch(err => {
         console.error(`[${label}] ERROR: ${err.shortMessage || err.reason || err.message || String(err)}`);
@@ -682,7 +715,20 @@ async function promptFundedMnemonicWorkers(args, selected) {
   });
   const targets = workers.map(({ index, wallet }) => ({ index, address: wallet.address }));
   await fundTargets(args, { fundingPk, targets, amountWei });
-  return workers;
+  let nextIndex = startIndex + selected.length;
+  let fundingQueue = Promise.resolve();
+  const rotateWorker = async (previousWorker, label) => {
+    const index = nextIndex++;
+    const wc = mnemonicWalletContract(mnemonic, index);
+    const target = { index, address: wc.wallet.address };
+    console.log(`[${label}] Next mnemonic wallet: ${target.address} (index ${index})`);
+    const rotationArgs = { ...args, yes: true, 'dry-run': false };
+    const task = fundingQueue.catch(() => {}).then(() => fundTargets(rotationArgs, { fundingPk, targets: [target], amountWei }));
+    fundingQueue = task;
+    await task;
+    return { device: previousWorker.device, index, ...wc };
+  };
+  return { workers, rotateWorker };
 }
 
 async function mineMultiGpu(args) {
@@ -695,12 +741,12 @@ async function mineMultiGpu(args) {
   const selected = devices.slice(0, count);
   const useFundedMnemonic = args['fund-mnemonic'] || await promptYesNo('Use one funding key + mnemonic-derived wallets?', true);
   if (useFundedMnemonic) {
-    const workers = await promptFundedMnemonicWorkers(args, selected);
+    const { workers, rotateWorker } = await promptFundedMnemonicWorkers(args, selected);
     if (args['dry-run']) {
       console.log('Dry-run: funding preview complete; miners not started.');
       return;
     }
-    return startGpuMiners(options, workers);
+    return startGpuMiners(options, workers, rotateWorker);
   }
   console.log('Enter one private key per GPU. Private keys are used in memory only and are not saved.');
   const workers = [];
@@ -727,6 +773,7 @@ async function selftest() {
   if (validPow(challenge, nonce, 0n) !== (BigInt(h) === 0n)) throw new Error('validPow zero target failed');
   const addr = deriveMnemonicAddress('test test test test test test test test test test test junk', 3);
   if (addr !== '0x90F79bf6EB2c4f870365E785982E1f101E93b906') throw new Error('mnemonic derivation mismatch');
+  if (!isPerAddressLimitError(new Error('execution reverted: "Exceed per address limit"'))) throw new Error('address limit detection failed');
   console.log('selftest ok');
 }
 
