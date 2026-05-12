@@ -1,0 +1,18 @@
+{
+  "name": "pfft-miner-bot",
+  "version": "1.0.0",
+  "description": "CLI mining bot for pffthash.com / Pow Free Fair Mint on Ethereum mainnet",
+  "type": "module",
+  "bin": {
+    "pfft-miner": "./pfft-miner.mjs"
+  },
+  "scripts": {
+    "check": "node --check pfft-miner.mjs",
+    "selftest": "node pfft-miner.mjs selftest",
+    "status": "node pfft-miner.mjs status"
+  },
+  "dependencies": {
+    "ethers": "^6.16.0"
+  },
+  "license": "MIT"
+}

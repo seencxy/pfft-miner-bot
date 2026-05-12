@@ -1,0 +1,216 @@
+#!/usr/bin/env node
+import { ethers } from 'ethers';
+import { randomBytes } from 'node:crypto';
+import process from 'node:process';
+
+const CONTRACT_ADDRESS = '0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB';
+const DEFAULT_RPC_URL = process.env.PFFT_RPC_URL || process.env.ETH_RPC_URL || 'https://ethereum-rpc.publicnode.com';
+const ABI = [
+  'function freeMint(uint256 powNonce) external',
+  'function getInfo() view returns (uint256 currentMinted,uint256 remainingSupply,uint256 currentDecayRate,uint256 nextMintAmount)',
+  'function calculateActualMint(uint256 requested) view returns (uint256)',
+  'function BASE_MINT_AMOUNT() view returns (uint256)',
+  'function MAX_SUPPLY() view returns (uint256)',
+  'function currentPowStage() view returns (uint256)',
+  'function currentPowHexZeros() view returns (uint256)',
+  'function POW_DIFFICULTY_BITS() view returns (uint256)',
+  'function POW_DIFFICULTY_MULTIPLIER() view returns (uint256)',
+  'function POW_TARGET() view returns (uint256)',
+  'function MIN_MINT_AMOUNT() view returns (uint256)',
+  'function currentPowChallenge(address user) view returns (bytes32)',
+  'function minted(address user) view returns (uint256)',
+  'function balanceOf(address owner) view returns (uint256)'
+];
+
+function usage() {
+  console.log(`PFFT miner bot
+
+Usage:
+  node pfft-miner.mjs status [--address 0x...]
+  node pfft-miner.mjs mine [--count 1] [--workers 4] [--dry-run]
+  node pfft-miner.mjs selftest
+
+Env:
+  PFFT_PRIVATE_KEY   Private key burner wallet for real mint
+  PFFT_RPC_URL       Ethereum mainnet RPC URL (default publicnode)
+  ETH_RPC_URL        Fallback RPC URL
+
+Options:
+  --count N          Number of successful mints, default 1, use 0 for infinite
+  --workers N        Parallel CPU workers in this process, default CPU count-ish
+  --dry-run          Find valid PoW nonce but do not send transaction
+  --max-fee-gwei N   Optional maxFeePerGas override
+  --priority-gwei N  Optional maxPriorityFeePerGas override
+`);
+}
+
+function parseArgs(argv) {
+  const args = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) { args._.push(a); continue; }
+    const key = a.slice(2);
+    if (['dry-run', 'help'].includes(key)) { args[key] = true; continue; }
+    args[key] = argv[++i];
+  }
+  return args;
+}
+
+function fmtToken(v) {
+  return Number(ethers.formatUnits(v, 18)).toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+function fmtRate(n) {
+  if (!Number.isFinite(n)) return '- H/s';
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)} MH/s`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(2)} KH/s`;
+  return `${n.toFixed(0)} H/s`;
+}
+function fmtEta(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '-';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return `${m}m ${r}s`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
+function provider() {
+  return new ethers.JsonRpcProvider(DEFAULT_RPC_URL, 1, { staticNetwork: true });
+}
+function readContract() {
+  return new ethers.Contract(CONTRACT_ADDRESS, ABI, provider());
+}
+function walletContract() {
+  const pk = process.env.PFFT_PRIVATE_KEY;
+  if (!pk) throw new Error('Set PFFT_PRIVATE_KEY for mine command. Use burner wallet only.');
+  const w = new ethers.Wallet(pk, provider());
+  return { wallet: w, contract: new ethers.Contract(CONTRACT_ADDRESS, ABI, w) };
+}
+
+function randomUint256() {
+  return BigInt('0x' + randomBytes(32).toString('hex'));
+}
+function powHash(challenge, nonce) {
+  // Matches site worker: ethers.solidityPackedKeccak256(['bytes32','uint256'], [challenge, nonce])
+  return BigInt(ethers.solidityPackedKeccak256(['bytes32', 'uint256'], [challenge, nonce]));
+}
+function validPow(challenge, nonce, target) {
+  return powHash(challenge, nonce) <= BigInt(target);
+}
+
+async function status(address) {
+  const c = readContract();
+  const [info, base, target, bits, stage, zeros] = await Promise.all([
+    c.getInfo(), c.BASE_MINT_AMOUNT(), c.POW_TARGET(), c.POW_DIFFICULTY_BITS(),
+    c.currentPowStage().catch(() => null), c.currentPowHexZeros().catch(() => null)
+  ]);
+  console.log(`Contract: ${CONTRACT_ADDRESS}`);
+  console.log(`RPC: ${DEFAULT_RPC_URL}`);
+  console.log(`Minted: ${fmtToken(info.currentMinted)} PFFT`);
+  console.log(`Remaining: ${fmtToken(info.remainingSupply)} PFFT`);
+  console.log(`Next mint quote: ${fmtToken(info.nextMintAmount)} PFFT`);
+  console.log(`Base request: ${fmtToken(base)} PFFT`);
+  console.log(`PoW target: ${target.toString()}`);
+  console.log(`Difficulty: ${bits.toString()}-bit${stage !== null ? ` stage ${Number(stage) + 1}/5` : ''}${zeros !== null ? ` hexZeros ${zeros}` : ''}`);
+  const expected = Number((2n ** 256n) / (BigInt(target) + 1n));
+  console.log(`Expected tries: ${expected.toLocaleString()}`);
+  if (address) {
+    const [minted, bal, challenge] = await Promise.all([c.minted(address), c.balanceOf(address), c.currentPowChallenge(address)]);
+    console.log(`Wallet: ${address}`);
+    console.log(`Wallet minted: ${fmtToken(minted)} PFFT`);
+    console.log(`Wallet balance: ${fmtToken(bal)} PFFT`);
+    console.log(`Current challenge: ${challenge}`);
+  }
+}
+
+async function findNonce({ challenge, target, workers = 1, reportMs = 2000 }) {
+  target = BigInt(target);
+  let attempts = 0n;
+  let solved = null;
+  const started = Date.now();
+  const loops = Array.from({ length: workers }, async (_, id) => {
+    let local = 0n;
+    while (!solved) {
+      const nonce = randomUint256();
+      local++;
+      if ((local & 0x3fffn) === 0n) attempts += 0x4000n;
+      if (validPow(challenge, nonce, target)) {
+        attempts += local & 0x3fffn;
+        solved = { nonce, worker: id };
+        return;
+      }
+      if ((local % 4096n) === 0n) await new Promise(r => setImmediate(r));
+    }
+  });
+  const timer = setInterval(() => {
+    const elapsed = Date.now() - started;
+    const rate = Number(attempts) / Math.max(elapsed / 1000, 0.001);
+    const expected = Number((2n ** 256n) / (target + 1n));
+    const eta = rate > 0 ? Math.max(0, (expected - Number(attempts)) / rate * 1000) : NaN;
+    process.stdout.write(`\rAttempts ${attempts.toLocaleString()} | ${fmtRate(rate)} | ETA avg ${fmtEta(eta)}   `);
+  }, reportMs);
+  await Promise.race(loops.map(p => p.then(() => true)));
+  clearInterval(timer);
+  process.stdout.write('\n');
+  return { ...solved, attempts, elapsedMs: Date.now() - started };
+}
+
+async function mine(args) {
+  const count = args.count === undefined ? 1 : Number(args.count);
+  const workers = args.workers ? Math.max(1, Number(args.workers)) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
+  const dryRun = !!args['dry-run'];
+  const { wallet, contract } = walletContract();
+  console.log(`Wallet: ${wallet.address}`);
+  console.log(`Contract: ${CONTRACT_ADDRESS}`);
+  console.log(`Mode: ${dryRun ? 'dry-run (no tx)' : 'real mint'}`);
+  let done = 0;
+  while (count === 0 || done < count) {
+    const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
+    console.log(`\nChallenge: ${challenge}`);
+    console.log(`Target: ${target.toString()}`);
+    const found = await findNonce({ challenge, target, workers });
+    const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
+    console.log(`Solved nonce: ${found.nonce.toString()}`);
+    console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
+    if (dryRun) {
+      console.log('Dry-run: transaction not sent.');
+      done++;
+      continue;
+    }
+    const overrides = {};
+    if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
+    if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
+    const tx = await contract.freeMint(found.nonce, overrides);
+    console.log(`Tx sent: ${tx.hash}`);
+    const rcpt = await tx.wait();
+    if (rcpt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`);
+    console.log(`Mint confirmed: block ${rcpt.blockNumber}`);
+    done++;
+  }
+}
+
+async function selftest() {
+  const challenge = '0x' + '11'.repeat(32);
+  const nonce = 123456789n;
+  const h = ethers.solidityPackedKeccak256(['bytes32', 'uint256'], [challenge, nonce]);
+  if (powHash(challenge, nonce) !== BigInt(h)) throw new Error('powHash mismatch');
+  if (!validPow(challenge, nonce, 2n ** 256n - 1n)) throw new Error('validPow high target failed');
+  if (validPow(challenge, nonce, 0n) !== (BigInt(h) === 0n)) throw new Error('validPow zero target failed');
+  console.log('selftest ok');
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const cmd = args._[0] || (args.help ? 'help' : 'status');
+  if (cmd === 'help' || args.help) return usage();
+  if (cmd === 'status') return status(args.address || process.env.PFFT_ADDRESS);
+  if (cmd === 'mine') return mine(args);
+  if (cmd === 'selftest') return selftest();
+  throw new Error(`Unknown command: ${cmd}`);
+}
+
+main().catch(err => {
+  console.error('ERROR:', err.shortMessage || err.reason || err.message || String(err));
+  process.exit(1);
+});
