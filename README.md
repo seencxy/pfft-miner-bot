@@ -112,14 +112,22 @@ node pfft-miner.mjs mine --gpu --count 0 --cuda-device 1
 Mode interaktif multi-GPU dalam satu terminal:
 
 ```bash
-node pfft-miner.mjs mine --multi-gpu --count 0 --cuda-bin ./build/pfft-cuda-miner --start-random --gas-limit 200000
+node pfft-miner.mjs mine --multi-gpu --fund-mnemonic --count 0 --cuda-bin ./build/pfft-cuda-miner --start-random --gas-limit 200000
 ```
 
-Bot akan menjalankan `nvidia-smi -L`, menanyakan jumlah GPU yang dipakai, lalu meminta private key berbeda untuk tiap GPU. Wallet address akan ditampilkan setelah private key dimasukkan.
+Bot akan menjalankan `nvidia-smi -L`, menanyakan jumlah GPU yang dipakai, meminta satu funding private key dan satu target mnemonic, lalu meminta start index dan jumlah ETH untuk tiap GPU wallet. Setelah transfer ETH ke wallet hasil derivasi mnemonic selesai, bot langsung memakai wallet tersebut untuk mining.
+
+Default path mnemonic:
+
+```text
+m/44'/60'/0'/0/{index}
+```
+
+Jika tidak memakai `--fund-mnemonic`, multi-GPU mode akan menanyakan apakah ingin memakai funding private key + mnemonic. Jawab `n` untuk mode lama: input private key berbeda untuk tiap GPU.
 
 ## Fund wallets from mnemonic
 
-Distribute ETH gas from one funding wallet to addresses derived from a mnemonic:
+Standalone ETH distribution, without starting miners:
 
 ```bash
 node pfft-miner.mjs fund-wallets

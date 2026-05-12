@@ -32,7 +32,7 @@ function usage() {
 Usage:
   node pfft-miner.mjs status [--address 0x...]
   node pfft-miner.mjs mine [--count 1] [--workers 4] [--gpu] [--dry-run]
-  node pfft-miner.mjs mine --multi-gpu [--count 0] [--cuda-bin PATH]
+  node pfft-miner.mjs mine --multi-gpu [--fund-mnemonic] [--count 0] [--cuda-bin PATH]
   node pfft-miner.mjs fund-wallets [--start-index 0] [--wallet-count 8] [--amount-eth 0.01]
   node pfft-miner.mjs selftest
 
@@ -48,6 +48,7 @@ Options:
   --workers N        Parallel CPU workers in this process, default CPU count-ish
   --gpu              Use CUDA solver ./build/pfft-cuda-miner (run make cuda first)
   --multi-gpu        Interactive multi-GPU CUDA mode with one wallet per GPU
+  --fund-mnemonic    In multi-GPU mode, fund and mine mnemonic-derived wallets
   --cuda-bin PATH    Custom CUDA solver path
   --cuda-device N    Run CUDA solver on physical GPU index N
   --start N          GPU uint64 search start nonce, decimal or hex
@@ -71,7 +72,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help', 'gpu', 'multi-gpu', 'start-random', 'yes'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu', 'multi-gpu', 'fund-mnemonic', 'start-random', 'yes'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -387,6 +388,17 @@ async function promptEthAmount(question, defaultValue) {
   }
 }
 
+async function promptYesNo(question, defaultValue = true) {
+  const suffix = defaultValue ? ' [Y/n]: ' : ' [y/N]: ';
+  while (true) {
+    const answer = (await promptLine(`${question}${suffix}`)).toLowerCase();
+    if (answer === '') return defaultValue;
+    if (['y', 'yes'].includes(answer)) return true;
+    if (['n', 'no'].includes(answer)) return false;
+    console.log('Enter y or n.');
+  }
+}
+
 async function promptGpuCount(devices) {
   while (true) {
     const answer = await promptLine(`How many GPUs to start? [1-${devices.length}, default ${devices.length}]: `);
@@ -413,9 +425,19 @@ function normalizeMnemonic(mnemonic) {
   return String(mnemonic || '').trim().replace(/\s+/g, ' ');
 }
 
-function deriveMnemonicAddress(mnemonic, index) {
+function deriveMnemonicWallet(mnemonic, index, p) {
   const path = `m/44'/60'/0'/0/${index}`;
-  return ethers.HDNodeWallet.fromPhrase(normalizeMnemonic(mnemonic), undefined, path).address;
+  const wallet = ethers.HDNodeWallet.fromPhrase(normalizeMnemonic(mnemonic), undefined, path);
+  return p ? wallet.connect(p) : wallet;
+}
+
+function mnemonicWalletContract(mnemonic, index) {
+  const wallet = deriveMnemonicWallet(mnemonic, index, provider());
+  return { wallet, contract: new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet) };
+}
+
+function deriveMnemonicAddress(mnemonic, index) {
+  return deriveMnemonicWallet(mnemonic, index).address;
 }
 
 function feeOverridesFromArgs(args, feeData) {
@@ -435,37 +457,22 @@ function feeOverridesFromArgs(args, feeData) {
   return { overrides, balanceFeePerGas: overrides.gasPrice, label: `${ethers.formatUnits(overrides.gasPrice, 'gwei')} gwei gasPrice` };
 }
 
-async function fundWallets(args) {
+async function fundTargets(args, { fundingPk, targets, amountWei }) {
   const p = provider();
-  const fundingPk = await promptRequiredSecret('Funding private key: ', process.env.PFFT_FUNDER_PRIVATE_KEY);
-  const mnemonic = await promptRequiredSecret('Target mnemonic phrase: ', process.env.PFFT_TARGET_MNEMONIC);
   const fundingWallet = new ethers.Wallet(normalizePrivateKey(fundingPk), p);
-  const startIndex = args['start-index'] === undefined
-    ? await promptNonNegativeInteger('Mnemonic start index', 0)
-    : parseNonNegativeIntegerArg(args['start-index'], '--start-index');
-  const walletCount = args['wallet-count'] === undefined
-    ? await promptPositiveInteger('Target wallet count')
-    : parsePositiveIntegerArg(args['wallet-count'], '--wallet-count');
-  const amountWei = args['amount-eth'] === undefined
-    ? await promptEthAmount('ETH amount per target wallet')
-    : parseEthAmountArg(args['amount-eth'], '--amount-eth');
-  const targets = Array.from({ length: walletCount }, (_, offset) => {
-    const index = startIndex + offset;
-    return { index, address: deriveMnemonicAddress(mnemonic, index) };
-  });
   const balance = await p.getBalance(fundingWallet.address);
   const feeData = await p.getFeeData();
   const gasLimit = 21000n;
   const { overrides: feeOverrides, balanceFeePerGas, label: feeLabel } = feeOverridesFromArgs(args, feeData);
-  const valueTotal = amountWei * BigInt(walletCount);
-  const maxGasTotal = gasLimit * balanceFeePerGas * BigInt(walletCount);
+  const valueTotal = amountWei * BigInt(targets.length);
+  const maxGasTotal = gasLimit * balanceFeePerGas * BigInt(targets.length);
   const maxRequired = valueTotal + maxGasTotal;
 
   console.log(`Funding wallet: ${fundingWallet.address}`);
   console.log(`Funding balance: ${ethers.formatEther(balance)} ETH`);
   console.log(`Mnemonic path: m/44'/60'/0'/0/{index}`);
-  console.log(`Start index: ${startIndex}`);
-  console.log(`Target wallets: ${walletCount}`);
+  console.log(`Start index: ${targets[0]?.index ?? 0}`);
+  console.log(`Target wallets: ${targets.length}`);
   console.log(`Amount per wallet: ${ethers.formatEther(amountWei)} ETH`);
   console.log(`Transfer total: ${ethers.formatEther(valueTotal)} ETH`);
   console.log(`Gas model: ${gasLimit.toString()} gas per transfer at ${feeLabel}`);
@@ -503,6 +510,25 @@ async function fundWallets(args) {
     if (rcpt.status !== 1) throw new Error(`[${target.index}] Transfer failed: ${tx.hash}`);
     console.log(`[${target.index}] Confirmed: block ${rcpt.blockNumber}`);
   }
+}
+
+async function fundWallets(args) {
+  const fundingPk = await promptRequiredSecret('Funding private key: ', process.env.PFFT_FUNDER_PRIVATE_KEY);
+  const mnemonic = await promptRequiredSecret('Target mnemonic phrase: ', process.env.PFFT_TARGET_MNEMONIC);
+  const startIndex = args['start-index'] === undefined
+    ? await promptNonNegativeInteger('Mnemonic start index', 0)
+    : parseNonNegativeIntegerArg(args['start-index'], '--start-index');
+  const walletCount = args['wallet-count'] === undefined
+    ? await promptPositiveInteger('Target wallet count')
+    : parsePositiveIntegerArg(args['wallet-count'], '--wallet-count');
+  const amountWei = args['amount-eth'] === undefined
+    ? await promptEthAmount('ETH amount per target wallet')
+    : parseEthAmountArg(args['amount-eth'], '--amount-eth');
+  const targets = Array.from({ length: walletCount }, (_, offset) => {
+    const index = startIndex + offset;
+    return { index, address: deriveMnemonicAddress(mnemonic, index) };
+  });
+  await fundTargets(args, { fundingPk, targets, amountWei });
 }
 
 async function findNonceGpu({ challenge, target, bin, start, cudaDevice, label, log = defaultLog }) {
@@ -623,23 +649,12 @@ async function runMineLoop({ options, wallet, contract, cudaDevice = options.cud
   }
 }
 
-async function mineMultiGpu(args) {
-  if (args['cuda-device'] !== undefined) throw new Error('Use either --multi-gpu or --cuda-device, not both');
-  const options = parseMineOptions(args, true);
-  const devices = await detectCudaDevices();
-  console.log(`Detected ${devices.length} NVIDIA GPU(s):`);
-  for (const d of devices) console.log(`  GPU ${d.index}: ${d.name}`);
-  const count = await promptGpuCount(devices);
-  const selected = devices.slice(0, count);
-  console.log('Enter one private key per GPU. Private keys are used in memory only and are not saved.');
-  const workers = [];
-  for (const device of selected) {
-    const wc = await promptWalletContractForDevice(device);
-    workers.push({ device, ...wc });
-  }
+async function startGpuMiners(options, workers) {
   console.log(`Starting ${workers.length} GPU miner(s). Count is ${options.count === 0 ? 'infinite' : options.count} per GPU.`);
-  const results = await Promise.all(workers.map(({ device, wallet, contract }) => {
+  const results = await Promise.all(workers.map(({ device, wallet, contract, index }) => {
     const label = `GPU ${device.index}`;
+    const walletLabel = index === undefined ? wallet.address : `${wallet.address} (mnemonic index ${index})`;
+    console.log(`[${label}] Wallet: ${walletLabel}`);
     return runMineLoop({ options, wallet, contract, cudaDevice: device.index, label, log: prefixedLog(label) })
       .then(() => true)
       .catch(err => {
@@ -648,6 +663,52 @@ async function mineMultiGpu(args) {
       });
   }));
   if (results.some(ok => !ok)) throw new Error('One or more GPU miners stopped with errors');
+}
+
+async function promptFundedMnemonicWorkers(args, selected) {
+  if (args['wallet-count'] !== undefined) throw new Error('--wallet-count is not used with mine --multi-gpu; the GPU count decides wallet count');
+  const fundingPk = await promptRequiredSecret('Funding private key: ', process.env.PFFT_FUNDER_PRIVATE_KEY);
+  const mnemonic = await promptRequiredSecret('Target mnemonic phrase: ', process.env.PFFT_TARGET_MNEMONIC);
+  const startIndex = args['start-index'] === undefined
+    ? await promptNonNegativeInteger('Mnemonic start index', 0)
+    : parseNonNegativeIntegerArg(args['start-index'], '--start-index');
+  const amountWei = args['amount-eth'] === undefined
+    ? await promptEthAmount('ETH amount per GPU wallet')
+    : parseEthAmountArg(args['amount-eth'], '--amount-eth');
+  const workers = selected.map((device, offset) => {
+    const index = startIndex + offset;
+    const { wallet, contract } = mnemonicWalletContract(mnemonic, index);
+    return { device, index, wallet, contract };
+  });
+  const targets = workers.map(({ index, wallet }) => ({ index, address: wallet.address }));
+  await fundTargets(args, { fundingPk, targets, amountWei });
+  return workers;
+}
+
+async function mineMultiGpu(args) {
+  if (args['cuda-device'] !== undefined) throw new Error('Use either --multi-gpu or --cuda-device, not both');
+  const options = parseMineOptions(args, true);
+  const devices = await detectCudaDevices();
+  console.log(`Detected ${devices.length} NVIDIA GPU(s):`);
+  for (const d of devices) console.log(`  GPU ${d.index}: ${d.name}`);
+  const count = await promptGpuCount(devices);
+  const selected = devices.slice(0, count);
+  const useFundedMnemonic = args['fund-mnemonic'] || await promptYesNo('Use one funding key + mnemonic-derived wallets?', true);
+  if (useFundedMnemonic) {
+    const workers = await promptFundedMnemonicWorkers(args, selected);
+    if (args['dry-run']) {
+      console.log('Dry-run: funding preview complete; miners not started.');
+      return;
+    }
+    return startGpuMiners(options, workers);
+  }
+  console.log('Enter one private key per GPU. Private keys are used in memory only and are not saved.');
+  const workers = [];
+  for (const device of selected) {
+    const wc = await promptWalletContractForDevice(device);
+    workers.push({ device, ...wc });
+  }
+  return startGpuMiners(options, workers);
 }
 
 async function mine(args) {
