@@ -109,6 +109,14 @@ node pfft-miner.mjs mine --gpu --count 0 --cuda-device 0
 node pfft-miner.mjs mine --gpu --count 0 --cuda-device 1
 ```
 
+Mode interaktif multi-GPU dalam satu terminal:
+
+```bash
+node pfft-miner.mjs mine --multi-gpu --count 0 --cuda-bin ./build/pfft-cuda-miner --start-random --gas-limit 200000
+```
+
+Bot akan menjalankan `nvidia-smi -L`, menanyakan jumlah GPU yang dipakai, lalu meminta private key berbeda untuk tiap GPU. Wallet address akan ditampilkan setelah private key dimasukkan.
+
 Bot otomatis menambahkan buffer 50% di atas `estimateGas` untuk menghindari transaksi gagal karena gas limit terlalu mepet. Override manual jika perlu:
 
 ```bash
