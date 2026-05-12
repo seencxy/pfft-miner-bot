@@ -10,7 +10,10 @@
     "check": "node --check pfft-miner.mjs",
     "selftest": "node pfft-miner.mjs selftest",
     "status": "node pfft-miner.mjs status",
-    "cuda": "make cuda"
+    "cuda": "make cuda",
+    "mine:gpu": "node pfft-miner.mjs mine --gpu --count 0",
+    "mine:gpu:once": "node pfft-miner.mjs mine --gpu --count 1",
+    "dryrun:gpu": "node pfft-miner.mjs mine --gpu --dry-run --count 1"
   },
   "dependencies": {
     "ethers": "^6.16.0"

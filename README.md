@@ -102,10 +102,29 @@ Dengan gas manual:
 node pfft-miner.mjs mine --gpu --count 1 --max-fee-gwei 3 --priority-gwei 0.2
 ```
 
-Infinite loop:
+Mint berkali-kali:
 
 ```bash
+# mint 5x lalu stop
+node pfft-miner.mjs mine --gpu --count 5
+
+# infinite loop: mint terus sampai screen/process distop
 node pfft-miner.mjs mine --gpu --count 0
+
+# shortcut npm infinite loop
+npm run mine:gpu
+```
+
+Helper script infinite loop:
+
+```bash
+./start-gpu-loop.sh
+```
+
+Atur jumlah mint lewat env:
+
+```bash
+PFFT_COUNT=10 ./start-gpu-loop.sh
 ```
 
 ## Run screen infinite GPU
@@ -115,7 +134,7 @@ cd /root/pfft-miner-bot
 export PFFT_RPC_URL="RPC_ETH_KAMU"
 export PFFT_PRIVATE_KEY="PRIVATE_KEY_BURNER_WALLET"
 
-screen -S pfft -dm bash -lc 'node pfft-miner.mjs mine --gpu --count 0 2>&1 | tee -a /root/pfft-miner.log'
+screen -S pfft -dm bash -lc './start-gpu-loop.sh'
 ```
 
 Cek log:
