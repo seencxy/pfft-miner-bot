@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { ethers } from 'ethers';
 import { randomBytes } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import process from 'node:process';
 
 const CONTRACT_ADDRESS = '0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB';
@@ -27,7 +29,7 @@ function usage() {
 
 Usage:
   node pfft-miner.mjs status [--address 0x...]
-  node pfft-miner.mjs mine [--count 1] [--workers 4] [--dry-run]
+  node pfft-miner.mjs mine [--count 1] [--workers 4] [--gpu] [--dry-run]
   node pfft-miner.mjs selftest
 
 Env:
@@ -38,6 +40,8 @@ Env:
 Options:
   --count N          Number of successful mints, default 1, use 0 for infinite
   --workers N        Parallel CPU workers in this process, default CPU count-ish
+  --gpu              Use CUDA solver ./build/pfft-cuda-miner (run make cuda first)
+  --cuda-bin PATH    Custom CUDA solver path
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
@@ -50,7 +54,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -156,10 +160,39 @@ async function findNonce({ challenge, target, workers = 1, reportMs = 2000 }) {
   return { ...solved, attempts, elapsedMs: Date.now() - started };
 }
 
+function uint256Hex(v) {
+  let h = BigInt(v).toString(16);
+  if (h.length > 64) throw new Error('uint256 too large');
+  return '0x' + h.padStart(64, '0');
+}
+
+async function findNonceGpu({ challenge, target, bin }) {
+  bin ||= process.env.PFFT_CUDA_BIN || './build/pfft-cuda-miner';
+  if (!existsSync(bin)) throw new Error(`CUDA solver not found: ${bin}. Build with: make cuda`);
+  const targetHex = uint256Hex(target);
+  console.log(`CUDA solver: ${bin}`);
+  const started = Date.now();
+  return await new Promise((resolve, reject) => {
+    const child = spawn(bin, [challenge, targetHex], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', d => { out += d.toString(); });
+    child.stderr.on('data', d => { process.stderr.write(d); });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code !== 0) return reject(new Error(`CUDA solver exited ${code}`));
+      const line = out.trim().split(/\s+/).pop();
+      if (!line || !/^\d+$/.test(line)) return reject(new Error(`CUDA solver returned invalid nonce: ${out}`));
+      const nonce = BigInt(line);
+      resolve({ nonce, worker: 'cuda', attempts: 0n, elapsedMs: Date.now() - started });
+    });
+  });
+}
+
 async function mine(args) {
   const count = args.count === undefined ? 1 : Number(args.count);
   const workers = args.workers ? Math.max(1, Number(args.workers)) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
   const dryRun = !!args['dry-run'];
+  const useGpu = !!args.gpu;
   const { wallet, contract } = walletContract();
   console.log(`Wallet: ${wallet.address}`);
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
@@ -169,7 +202,9 @@ async function mine(args) {
     const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
     console.log(`\nChallenge: ${challenge}`);
     console.log(`Target: ${target.toString()}`);
-    const found = await findNonce({ challenge, target, workers });
+    const found = useGpu
+      ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'] })
+      : await findNonce({ challenge, target, workers });
     const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
     console.log(`Solved nonce: ${found.nonce.toString()}`);
     console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
