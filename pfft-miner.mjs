@@ -42,6 +42,9 @@ Options:
   --workers N        Parallel CPU workers in this process, default CPU count-ish
   --gpu              Use CUDA solver ./build/pfft-cuda-miner (run make cuda first)
   --cuda-bin PATH    Custom CUDA solver path
+  --start N          GPU uint64 search start nonce, decimal or hex
+  --start-random     Use random GPU search start nonce (default)
+  --duplicate-retries N Retry when chain rejects an already used PoW nonce, default 5
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
@@ -54,7 +57,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help', 'gpu'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu', 'start-random'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -94,6 +97,25 @@ function walletContract() {
 
 function randomUint256() {
   return BigInt('0x' + randomBytes(32).toString('hex'));
+}
+function randomUint64() {
+  return BigInt('0x' + randomBytes(8).toString('hex'));
+}
+function parseBigIntArg(value, name) {
+  if (value === undefined) throw new Error(`${name} requires a value`);
+  const s = String(value);
+  if (/^0x[0-9a-f]+$/i.test(s) || /^[0-9]+$/.test(s)) return BigInt(s);
+  throw new Error(`${name} must be a decimal or hex integer`);
+}
+function parseUint64Arg(value, name) {
+  const v = parseBigIntArg(value, name);
+  if (v < 0n || v > ((1n << 64n) - 1n)) throw new Error(`${name} must fit uint64`);
+  return v;
+}
+function parseNonNegativeIntegerArg(value, name) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${name} must be a non-negative integer`);
+  return n;
 }
 function powHash(challenge, nonce) {
   // Matches site worker: ethers.solidityPackedKeccak256(['bytes32','uint256'], [challenge, nonce])
@@ -166,14 +188,32 @@ function uint256Hex(v) {
   return '0x' + h.padStart(64, '0');
 }
 
-async function findNonceGpu({ challenge, target, bin }) {
+function errorText(err) {
+  return [
+    err?.shortMessage,
+    err?.reason,
+    err?.message,
+    err?.info?.error?.message,
+    err?.error?.message,
+    err?.data?.message
+  ].filter(Boolean).join('\n');
+}
+
+function isDuplicatePowNonceError(err) {
+  return /Duplicate POW nonce/i.test(errorText(err));
+}
+
+async function findNonceGpu({ challenge, target, bin, start }) {
   bin ||= process.env.PFFT_CUDA_BIN || './build/pfft-cuda-miner';
   if (!existsSync(bin)) throw new Error(`CUDA solver not found: ${bin}. Build with: make cuda`);
+  const targetBig = BigInt(target);
   const targetHex = uint256Hex(target);
+  const startNonce = start === undefined ? randomUint64() : parseUint64Arg(start, '--start');
   console.log(`CUDA solver: ${bin}`);
+  console.log(`GPU start: ${startNonce.toString()}`);
   const started = Date.now();
   return await new Promise((resolve, reject) => {
-    const child = spawn(bin, [challenge, targetHex], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(bin, [challenge, targetHex, '--start', startNonce.toString()], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', d => { out += d.toString(); });
     child.stderr.on('data', d => { process.stderr.write(d); });
@@ -183,45 +223,65 @@ async function findNonceGpu({ challenge, target, bin }) {
       const line = out.trim().split(/\s+/).pop();
       if (!line || !/^\d+$/.test(line)) return reject(new Error(`CUDA solver returned invalid nonce: ${out}`));
       const nonce = BigInt(line);
+      if (!validPow(challenge, nonce, targetBig)) return reject(new Error(`CUDA solver returned nonce that does not satisfy target: ${nonce}`));
       resolve({ nonce, worker: 'cuda', attempts: 0n, elapsedMs: Date.now() - started });
     });
   });
 }
 
 async function mine(args) {
-  const count = args.count === undefined ? 1 : Number(args.count);
-  const workers = args.workers ? Math.max(1, Number(args.workers)) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
+  const count = args.count === undefined ? 1 : parseNonNegativeIntegerArg(args.count, '--count');
+  const workers = args.workers ? Math.max(1, parseNonNegativeIntegerArg(args.workers, '--workers')) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
+  const duplicateRetries = args['duplicate-retries'] === undefined ? 5 : parseNonNegativeIntegerArg(args['duplicate-retries'], '--duplicate-retries');
   const dryRun = !!args['dry-run'];
   const useGpu = !!args.gpu;
+  if (args.start !== undefined && args['start-random']) throw new Error('Use either --start or --start-random, not both');
+  const fixedGpuStart = args.start === undefined ? undefined : parseUint64Arg(args.start, '--start');
   const { wallet, contract } = walletContract();
   console.log(`Wallet: ${wallet.address}`);
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
   console.log(`Mode: ${dryRun ? 'dry-run (no tx)' : 'real mint'}`);
   let done = 0;
   while (count === 0 || done < count) {
-    const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
-    console.log(`\nChallenge: ${challenge}`);
-    console.log(`Target: ${target.toString()}`);
-    const found = useGpu
-      ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'] })
-      : await findNonce({ challenge, target, workers });
-    const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
-    console.log(`Solved nonce: ${found.nonce.toString()}`);
-    console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
-    if (dryRun) {
-      console.log('Dry-run: transaction not sent.');
-      done++;
-      continue;
+    let duplicateFailures = 0;
+    while (true) {
+      const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
+      console.log(`\nChallenge: ${challenge}`);
+      console.log(`Target: ${target.toString()}`);
+      const gpuStart = useGpu
+        ? (fixedGpuStart !== undefined && duplicateFailures === 0 ? fixedGpuStart : randomUint64())
+        : undefined;
+      const found = useGpu
+        ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'], start: gpuStart })
+        : await findNonce({ challenge, target, workers });
+      const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
+      console.log(`Solved nonce: ${found.nonce.toString()}`);
+      console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
+      if (dryRun) {
+        console.log('Dry-run: transaction not sent.');
+        done++;
+        break;
+      }
+      const overrides = {};
+      if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
+      if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
+      try {
+        const tx = await contract.freeMint(found.nonce, overrides);
+        console.log(`Tx sent: ${tx.hash}`);
+        const rcpt = await tx.wait();
+        if (rcpt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`);
+        console.log(`Mint confirmed: block ${rcpt.blockNumber}`);
+        done++;
+        break;
+      } catch (err) {
+        if (isDuplicatePowNonceError(err) && duplicateFailures < duplicateRetries) {
+          duplicateFailures++;
+          console.log(`Duplicate POW nonce rejected; retrying with a new search start (${duplicateFailures}/${duplicateRetries}).`);
+          continue;
+        }
+        throw err;
+      }
     }
-    const overrides = {};
-    if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
-    if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
-    const tx = await contract.freeMint(found.nonce, overrides);
-    console.log(`Tx sent: ${tx.hash}`);
-    const rcpt = await tx.wait();
-    if (rcpt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`);
-    console.log(`Mint confirmed: block ${rcpt.blockNumber}`);
-    done++;
   }
 }
 

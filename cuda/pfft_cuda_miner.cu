@@ -2,6 +2,7 @@
 // PoW: keccak256(solidityPacked(['bytes32','uint256'], [challenge, nonce])) <= target
 // This miner searches uint64 nonces encoded as uint256 (24 zero bytes + nonce_be64).
 #include <cuda_runtime.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -135,9 +136,26 @@ static int parse_hex32(const char *hex, uint8_t out[32]) {
     return 1;
 }
 
+static int parse_u64(const char *s, uint64_t *out) {
+    if (!s || !*s) return 0;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno != 0 || end == s || *end != '\0') return 0;
+    *out = (uint64_t)v;
+    return 1;
+}
+
+static int parse_int_arg(const char *s, int *out) {
+    uint64_t v = 0;
+    if (!parse_u64(s, &v) || v > 2147483647ULL) return 0;
+    *out = (int)v;
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <challenge_bytes32_hex> <target_hex_or_decimal> [blocks] [threads] [iters_per_thread]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <challenge_bytes32_hex> <target_hex_or_decimal> [blocks] [threads] [iters_per_thread] [--start uint64]\n", argv[0]);
         return 2;
     }
     uint8_t challenge[32], target[32];
@@ -162,9 +180,41 @@ int main(int argc, char **argv) {
         // division loop above produced little-endian-ish shift; easier path is require hex from Node.
     }
 
-    int blocks = argc > 3 ? atoi(argv[3]) : 0;
-    int threads = argc > 4 ? atoi(argv[4]) : 256;
-    uint64_t iters = argc > 5 ? strtoull(argv[5], NULL, 10) : 4096ULL;
+    int blocks = 0;
+    int threads = 256;
+    uint64_t iters = 4096ULL;
+    uint64_t start = 0;
+    int have_start = 0;
+    int positional = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--start") == 0) {
+            if (++i >= argc || !parse_u64(argv[i], &start)) { fprintf(stderr, "bad --start\n"); return 2; }
+            have_start = 1;
+        } else if (strcmp(argv[i], "--blocks") == 0) {
+            if (++i >= argc || !parse_int_arg(argv[i], &blocks)) { fprintf(stderr, "bad --blocks\n"); return 2; }
+        } else if (strcmp(argv[i], "--threads") == 0) {
+            if (++i >= argc || !parse_int_arg(argv[i], &threads)) { fprintf(stderr, "bad --threads\n"); return 2; }
+        } else if (strcmp(argv[i], "--iters") == 0) {
+            if (++i >= argc || !parse_u64(argv[i], &iters)) { fprintf(stderr, "bad --iters\n"); return 2; }
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 2;
+        } else if (positional == 0) {
+            if (!parse_int_arg(argv[i], &blocks)) { fprintf(stderr, "bad blocks\n"); return 2; }
+            positional++;
+        } else if (positional == 1) {
+            if (!parse_int_arg(argv[i], &threads)) { fprintf(stderr, "bad threads\n"); return 2; }
+            positional++;
+        } else if (positional == 2) {
+            if (!parse_u64(argv[i], &iters)) { fprintf(stderr, "bad iters_per_thread\n"); return 2; }
+            positional++;
+        } else {
+            fprintf(stderr, "too many positional arguments\n");
+            return 2;
+        }
+    }
+    if (threads <= 0) { fprintf(stderr, "threads must be > 0\n"); return 2; }
+    if (iters == 0) { fprintf(stderr, "iters_per_thread must be > 0\n"); return 2; }
     int dev = 0; cudaSetDevice(dev);
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
     if (blocks <= 0) blocks = prop.multiProcessorCount * 8;
@@ -176,8 +226,8 @@ int main(int argc, char **argv) {
     cudaMalloc(&d_found, sizeof(unsigned long long)); cudaMalloc(&d_nonce, sizeof(unsigned long long));
     cudaMemset(d_found, 0, sizeof(unsigned long long)); cudaMemset(d_nonce, 0, sizeof(unsigned long long));
 
-    fprintf(stderr, "device=%s blocks=%d threads=%d stride=%llu iters=%llu\n", prop.name, blocks, threads, (unsigned long long)stride, (unsigned long long)iters);
-    uint64_t start = (uint64_t)time(NULL) * 1000003ULL;
+    if (!have_start) start = (uint64_t)time(NULL) * 1000003ULL;
+    fprintf(stderr, "device=%s blocks=%d threads=%d stride=%llu iters=%llu start=%llu\n", prop.name, blocks, threads, (unsigned long long)stride, (unsigned long long)iters, (unsigned long long)start);
     unsigned long long found = 0, nonce = 0;
     unsigned long long batches = 0;
     while (!found) {

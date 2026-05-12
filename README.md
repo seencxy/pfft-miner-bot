@@ -102,6 +102,24 @@ Dengan gas manual:
 node pfft-miner.mjs mine --gpu --count 1 --max-fee-gwei 3 --priority-gwei 0.2
 ```
 
+GPU mode memakai start nonce uint64 acak secara default supaya miner tidak terus mencari di range yang sama dengan miner lain. Flag `--start-random` juga diterima:
+
+```bash
+node pfft-miner.mjs mine --gpu --count 1 --start-random
+```
+
+Untuk benchmark/reproducible test, start bisa dipatok manual:
+
+```bash
+node pfft-miner.mjs mine --gpu --dry-run --count 1 --start 0
+```
+
+Jika contract menolak dengan `Duplicate POW nonce`, bot otomatis mencari nonce baru sampai 5 kali. Ubah limit retry:
+
+```bash
+node pfft-miner.mjs mine --gpu --count 1 --duplicate-retries 10
+```
+
 Mint berkali-kali:
 
 ```bash
