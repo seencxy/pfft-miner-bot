@@ -102,6 +102,13 @@ Dengan gas manual:
 node pfft-miner.mjs mine --gpu --count 1 --max-fee-gwei 3 --priority-gwei 0.2
 ```
 
+Pilih GPU langsung dari command line:
+
+```bash
+node pfft-miner.mjs mine --gpu --count 0 --cuda-device 0
+node pfft-miner.mjs mine --gpu --count 0 --cuda-device 1
+```
+
 Bot otomatis menambahkan buffer 50% di atas `estimateGas` untuk menghindari transaksi gagal karena gas limit terlalu mepet. Override manual jika perlu:
 
 ```bash

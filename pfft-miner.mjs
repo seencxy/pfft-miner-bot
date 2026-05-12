@@ -42,6 +42,7 @@ Options:
   --workers N        Parallel CPU workers in this process, default CPU count-ish
   --gpu              Use CUDA solver ./build/pfft-cuda-miner (run make cuda first)
   --cuda-bin PATH    Custom CUDA solver path
+  --cuda-device N    Run CUDA solver on physical GPU index N
   --start N          GPU uint64 search start nonce, decimal or hex
   --start-random     Use random GPU search start nonce (default)
   --duplicate-retries N Retry when chain rejects an already used PoW nonce, default 5
@@ -224,17 +225,21 @@ function withGasBuffer(estimatedGas, bufferPercent) {
   return estimatedGas + (estimatedGas * BigInt(bufferPercent)) / 100n;
 }
 
-async function findNonceGpu({ challenge, target, bin, start }) {
+async function findNonceGpu({ challenge, target, bin, start, cudaDevice }) {
   bin ||= process.env.PFFT_CUDA_BIN || './build/pfft-cuda-miner';
   if (!existsSync(bin)) throw new Error(`CUDA solver not found: ${bin}. Build with: make cuda`);
   const targetBig = BigInt(target);
   const targetHex = uint256Hex(target);
   const startNonce = start === undefined ? randomUint64() : parseUint64Arg(start, '--start');
+  const env = cudaDevice === undefined
+    ? process.env
+    : { ...process.env, CUDA_VISIBLE_DEVICES: String(cudaDevice) };
   console.log(`CUDA solver: ${bin}`);
+  if (cudaDevice !== undefined) console.log(`CUDA device: ${cudaDevice}`);
   console.log(`GPU start: ${startNonce.toString()}`);
   const started = Date.now();
   return await new Promise((resolve, reject) => {
-    const child = spawn(bin, [challenge, targetHex, '--start', startNonce.toString()], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(bin, [challenge, targetHex, '--start', startNonce.toString()], { stdio: ['ignore', 'pipe', 'pipe'], env });
     let out = '';
     child.stdout.on('data', d => { out += d.toString(); });
     child.stderr.on('data', d => { process.stderr.write(d); });
@@ -256,6 +261,7 @@ async function mine(args) {
   const duplicateRetries = args['duplicate-retries'] === undefined ? 5 : parseNonNegativeIntegerArg(args['duplicate-retries'], '--duplicate-retries');
   const gasBufferPercent = args['gas-buffer-percent'] === undefined ? 50 : parseNonNegativeIntegerArg(args['gas-buffer-percent'], '--gas-buffer-percent');
   const manualGasLimit = args['gas-limit'] === undefined ? undefined : parsePositiveBigIntArg(args['gas-limit'], '--gas-limit');
+  const cudaDevice = args['cuda-device'] === undefined ? undefined : parseNonNegativeIntegerArg(args['cuda-device'], '--cuda-device');
   const dryRun = !!args['dry-run'];
   const useGpu = !!args.gpu;
   if (args.start !== undefined && args['start-random']) throw new Error('Use either --start or --start-random, not both');
@@ -275,7 +281,7 @@ async function mine(args) {
         ? (fixedGpuStart !== undefined && duplicateFailures === 0 ? fixedGpuStart : randomUint64())
         : undefined;
       const found = useGpu
-        ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'], start: gpuStart })
+        ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'], start: gpuStart, cudaDevice })
         : await findNonce({ challenge, target, workers });
       const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
       console.log(`Solved nonce: ${found.nonce.toString()}`);
