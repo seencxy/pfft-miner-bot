@@ -45,6 +45,8 @@ Options:
   --start N          GPU uint64 search start nonce, decimal or hex
   --start-random     Use random GPU search start nonce (default)
   --duplicate-retries N Retry when chain rejects an already used PoW nonce, default 5
+  --gas-limit N      Manual gas limit for freeMint transactions
+  --gas-buffer-percent N Add gas estimate buffer, default 50
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
@@ -116,6 +118,11 @@ function parseNonNegativeIntegerArg(value, name) {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) throw new Error(`${name} must be a non-negative integer`);
   return n;
+}
+function parsePositiveBigIntArg(value, name) {
+  const v = parseBigIntArg(value, name);
+  if (v <= 0n) throw new Error(`${name} must be greater than zero`);
+  return v;
 }
 function powHash(challenge, nonce) {
   // Matches site worker: ethers.solidityPackedKeccak256(['bytes32','uint256'], [challenge, nonce])
@@ -203,6 +210,20 @@ function isDuplicatePowNonceError(err) {
   return /Duplicate POW nonce/i.test(errorText(err));
 }
 
+function isOutOfGasError(err) {
+  const receiptGasUsed = err?.receipt?.gasUsed;
+  const txGasLimit = err?.transaction?.gasLimit;
+  return receiptGasUsed !== undefined && txGasLimit !== undefined && receiptGasUsed === txGasLimit;
+}
+
+function txHashFromError(err) {
+  return err?.receipt?.hash || err?.transaction?.hash;
+}
+
+function withGasBuffer(estimatedGas, bufferPercent) {
+  return estimatedGas + (estimatedGas * BigInt(bufferPercent)) / 100n;
+}
+
 async function findNonceGpu({ challenge, target, bin, start }) {
   bin ||= process.env.PFFT_CUDA_BIN || './build/pfft-cuda-miner';
   if (!existsSync(bin)) throw new Error(`CUDA solver not found: ${bin}. Build with: make cuda`);
@@ -233,6 +254,8 @@ async function mine(args) {
   const count = args.count === undefined ? 1 : parseNonNegativeIntegerArg(args.count, '--count');
   const workers = args.workers ? Math.max(1, parseNonNegativeIntegerArg(args.workers, '--workers')) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
   const duplicateRetries = args['duplicate-retries'] === undefined ? 5 : parseNonNegativeIntegerArg(args['duplicate-retries'], '--duplicate-retries');
+  const gasBufferPercent = args['gas-buffer-percent'] === undefined ? 50 : parseNonNegativeIntegerArg(args['gas-buffer-percent'], '--gas-buffer-percent');
+  const manualGasLimit = args['gas-limit'] === undefined ? undefined : parsePositiveBigIntArg(args['gas-limit'], '--gas-limit');
   const dryRun = !!args['dry-run'];
   const useGpu = !!args.gpu;
   if (args.start !== undefined && args['start-random']) throw new Error('Use either --start or --start-random, not both');
@@ -266,6 +289,14 @@ async function mine(args) {
       if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
       if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
       try {
+        if (manualGasLimit !== undefined) {
+          overrides.gasLimit = manualGasLimit;
+          console.log(`Gas limit: ${overrides.gasLimit.toString()} (manual)`);
+        } else {
+          const estimatedGas = await contract.freeMint.estimateGas(found.nonce, overrides);
+          overrides.gasLimit = withGasBuffer(estimatedGas, gasBufferPercent);
+          console.log(`Gas estimate: ${estimatedGas.toString()} | limit: ${overrides.gasLimit.toString()} (+${gasBufferPercent}%)`);
+        }
         const tx = await contract.freeMint(found.nonce, overrides);
         console.log(`Tx sent: ${tx.hash}`);
         const rcpt = await tx.wait();
@@ -278,6 +309,11 @@ async function mine(args) {
           duplicateFailures++;
           console.log(`Duplicate POW nonce rejected; retrying with a new search start (${duplicateFailures}/${duplicateRetries}).`);
           continue;
+        }
+        if (isOutOfGasError(err)) {
+          const hash = txHashFromError(err);
+          const suffix = hash ? ` Tx: ${hash}` : '';
+          throw new Error(`Mint transaction exhausted its gas limit. Increase --gas-limit or --gas-buffer-percent.${suffix}`);
         }
         throw err;
       }

@@ -102,6 +102,13 @@ Dengan gas manual:
 node pfft-miner.mjs mine --gpu --count 1 --max-fee-gwei 3 --priority-gwei 0.2
 ```
 
+Bot otomatis menambahkan buffer 50% di atas `estimateGas` untuk menghindari transaksi gagal karena gas limit terlalu mepet. Override manual jika perlu:
+
+```bash
+node pfft-miner.mjs mine --gpu --count 1 --gas-limit 200000
+node pfft-miner.mjs mine --gpu --count 1 --gas-buffer-percent 100
+```
+
 GPU mode memakai start nonce uint64 acak secara default supaya miner tidak terus mencari di range yang sama dengan miner lain. Flag `--start-random` juga diterima:
 
 ```bash
